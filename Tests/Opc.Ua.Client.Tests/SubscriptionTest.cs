@@ -1629,5 +1629,162 @@ namespace Opc.Ua.Client.Tests
             // Clean up
             await subscription.DeleteAsync(true, CancellationToken.None).ConfigureAwait(false);
         }
+
+        /// <summary>
+        /// Test that Dispose() does not deadlock when called while data changes are being processed.
+        /// This test reproduces the issue where ResetPublishTimerAndWorkerState() uses
+        /// .GetAwaiter().GetResult() to wait for the message worker task, which can deadlock
+        /// if the worker is actively processing notifications.
+        /// </summary>
+        /// <remarks>
+        /// See: https://github.com/OPCFoundation/UA-.NETStandard/commit/876cf28c325701a90a3fcb2466f5ba2ddca7533f
+        ///
+        /// The deadlock pattern (reproduced from real-world SubscriptionsManager usage):
+        ///
+        /// Dispose thread:
+        ///   ClearSubscriptionsInternal()
+        ///     └─ lock (_subscriptionsLock)  ← HOLDS LOCK
+        ///         └─ subscription.Dispose()
+        ///             └─ ResetPublishTimerAndWorkerState()
+        ///                 └─ .GetAwaiter().GetResult()  ← BLOCKS waiting for worker
+        ///
+        /// Worker thread (callback still executing when dispose starts waiting):
+        ///   FastDataChangeCallback (still running from before dispose started)
+        ///     └─ Tries to acquire _subscriptionsLock
+        ///         └─ DEADLOCK! (dispose holds lock, waits for worker; worker waits for lock)
+        /// </remarks>
+        [Test]
+        [Order(1200)]
+        public async Task DisposeDoesNotDeadlockDuringActiveDataChanges()
+        {
+            const int TimeoutMs = 10_000; // 10 second timeout to detect deadlock
+            const int WarmupMs = 2_000;   // Wait for data to start flowing
+
+            var subscription = new TestableSubscription(Session.DefaultSubscription)
+            {
+                PublishingInterval = 50,   // Very fast publishing to increase callback frequency
+                KeepAliveCount = 10,
+                PublishingEnabled = true,
+                DisableMonitoredItemCache = true
+            };
+
+            int notificationCount = 0;
+            int callbacksWhileDisposing = 0;
+            var dataFlowing = new ManualResetEventSlim(false);
+            var callbackIsRunning = new ManualResetEventSlim(false);
+            var disposeHasLock = new ManualResetEventSlim(false);
+            object subscriptionsLock = new object(); // Simulates SubscriptionsManager._subscriptionsLock
+
+            // Set up callback that simulates real-world usage pattern from SubscriptionsManager.
+            // The key to reproducing the deadlock:
+            // 1. Callback starts running (before dispose)
+            // 2. Callback signals it's running and waits for dispose to acquire the lock
+            // 3. Dispose acquires lock, signals, then calls Dispose() which waits for worker
+            // 4. Callback tries to acquire the lock → DEADLOCK
+            subscription.FastDataChangeCallback = (s, notification, _) =>
+            {
+                int count = Interlocked.Increment(ref notificationCount);
+                if (count >= 3)
+                {
+                    dataFlowing.Set();
+                }
+
+                // After enough warmup, set up the deadlock condition
+                if (count >= 5)
+                {
+                    Interlocked.Increment(ref callbacksWhileDisposing);
+
+                    // Signal that callback is running
+                    callbackIsRunning.Set();
+
+                    // Wait for dispose thread to acquire the lock
+                    // This ensures we're in the callback when dispose starts waiting for us
+                    disposeHasLock.Wait(1000);
+
+                    // Small delay to ensure dispose has called .GetAwaiter().GetResult()
+                    Thread.Sleep(100);
+
+                    // Now try to acquire the lock - this is where deadlock occurs!
+                    // Dispose is holding the lock and waiting for this callback to complete.
+                    // We're trying to acquire the lock that dispose holds.
+                    // DEADLOCK!
+                    lock (subscriptionsLock)
+                    {
+                        // This code will never execute if deadlock occurs
+                        var id = s.Id;
+                    }
+                }
+            };
+
+            // Add subscription to session
+            Session.AddSubscription(subscription);
+            await subscription.CreateAsync().ConfigureAwait(false);
+
+            // Add monitored items with simulated changing values
+            IList<NodeId> simulatedNodes = GetTestSetSimulation(Session.NamespaceUris);
+            var monitoredItems = CreateMonitoredItemTestSet(subscription, simulatedNodes).ToList();
+
+            // Also add CurrentTime which changes every cycle
+            monitoredItems.Add(new TestableMonitoredItem(subscription.DefaultItem)
+            {
+                DisplayName = "ServerStatusCurrentTime",
+                StartNodeId = VariableIds.Server_ServerStatus_CurrentTime,
+                SamplingInterval = 50,
+                QueueSize = 10
+            });
+
+            subscription.AddItems(monitoredItems);
+            await subscription.ApplyChangesAsync().ConfigureAwait(false);
+
+            // Wait for data to start flowing
+            bool dataStarted = dataFlowing.Wait(WarmupMs);
+            TestContext.Out.WriteLine($"Data flowing: {dataStarted}, Notifications received: {notificationCount}");
+
+            if (!dataStarted)
+            {
+                // Clean up and skip if no data is flowing
+                await Session.RemoveSubscriptionAsync(subscription).ConfigureAwait(false);
+                Assert.Ignore("No data changes received - cannot reproduce the issue");
+            }
+
+            // Simulate the SubscriptionsManager.ClearSubscriptionsInternal() pattern
+            var disposeTask = Task.Run(() =>
+            {
+                // Wait for a callback to be running
+                callbackIsRunning.Wait(2000);
+
+                lock (subscriptionsLock)
+                {
+                    // Signal that we have the lock - callback will now try to acquire it
+                    disposeHasLock.Set();
+
+                    // Call Dispose while holding the lock
+                    // Dispose internally calls ResetPublishTimerAndWorkerState() which does
+                    // .GetAwaiter().GetResult() to wait for the message worker task.
+                    // The callback is currently running and will try to acquire our lock.
+                    // DEADLOCK: we wait for worker, worker (callback) waits for our lock!
+                    subscription.Dispose();
+                }
+            });
+
+            bool completedInTime = await Task.WhenAny(
+                disposeTask,
+                Task.Delay(TimeoutMs)
+            ).ConfigureAwait(false) == disposeTask;
+
+            if (!completedInTime)
+            {
+                Assert.Fail(
+                    $"Dispose() deadlocked! Did not complete within {TimeoutMs}ms. " +
+                    $"Notifications received: {notificationCount}, Callbacks during dispose: {callbacksWhileDisposing}. " +
+                    "This demonstrates the sync-over-async issue in ResetPublishTimerAndWorkerState(). " +
+                    "The fix should use async dispose (IAsyncDisposable) or not block on the worker task.");
+            }
+
+            // If we got here, dispose completed successfully (no deadlock)
+            TestContext.Out.WriteLine(
+                $"Dispose completed successfully. Total notifications: {notificationCount}, " +
+                $"Callbacks during dispose: {callbacksWhileDisposing}");
+        }
     }
 }

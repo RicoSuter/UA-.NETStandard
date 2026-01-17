@@ -154,21 +154,19 @@ namespace Opc.Ua.Client
         /// <summary>
         /// Resets the state of the publish timer and associated message worker.
         /// </summary>
+        /// <remarks>
+        /// This method signals the worker to stop but does not wait for it to complete.
+        /// Waiting synchronously could cause deadlock if the caller holds a lock that
+        /// a callback also needs. The worker will exit on its next loop iteration when
+        /// it checks the cancellation token. The CTS is disposed via a continuation
+        /// when the worker completes.
+        /// </remarks>
         private void ResetPublishTimerAndWorkerState()
-        {
-            ResetPublishTimerAndWorkerStateAsync().GetAwaiter().GetResult();
-        }
-
-        /// <summary>
-        /// Resets the state of the publish timer and associated message worker.
-        /// </summary>
-        private async Task ResetPublishTimerAndWorkerStateAsync()
         {
             Task? workerTask;
             CancellationTokenSource? workerCts;
             lock (m_cache)
             {
-                // Called under the m_cache lock
                 if (m_publishTimer == null &&
                     m_messageWorkerCts == null &&
                     m_messageWorkerTask == null &&
@@ -188,21 +186,91 @@ namespace Opc.Ua.Client
                     return;
                 }
 
-                // stop the publish worker (outside of lock)
+                // Get references to stop the worker (will signal outside of lock)
                 workerTask = m_messageWorkerTask;
                 workerCts = m_messageWorkerCts;
                 m_messageWorkerTask = null;
                 m_messageWorkerCts = null;
             }
+
+            // Signal the worker to stop (outside of lock to avoid deadlock)
+            m_messageWorkerEvent.Set();
+            workerCts?.Cancel();
+
+            // Dispose CTS when worker completes (don't wait - avoids deadlock)
+            // The worker will exit on its next loop iteration when it checks
+            // ct.IsCancellationRequested or m_disposed
+            _ = workerTask.ContinueWith(t =>
+            {
+                Utils.SilentDispose(workerCts);
+                if (t.IsFaulted && t.Exception != null)
+                {
+                    foreach (var e in t.Exception.InnerExceptions)
+                    {
+                        if (e is not OperationCanceledException)
+                        {
+                            m_logger.LogError(e, "SubscriptionId {SubscriptionId} - Publish Worker exception.", Id);
+                        }
+                    }
+                }
+            }, TaskScheduler.Default);
+        }
+
+        /// <summary>
+        /// Async version of ResetPublishTimerAndWorkerState that awaits the worker task.
+        /// </summary>
+        /// <remarks>
+        /// Use this version in async contexts like DeleteAsync where waiting for the
+        /// worker to complete is desired behavior.
+        /// </remarks>
+        private async Task ResetPublishTimerAndWorkerStateAsync()
+        {
+            Task? workerTask;
+            CancellationTokenSource? workerCts;
+            lock (m_cache)
+            {
+                if (m_publishTimer == null &&
+                    m_messageWorkerCts == null &&
+                    m_messageWorkerTask == null &&
+                    m_messageWorkerEvent == null)
+                {
+                    return;
+                }
+
+                // stop the publish timer.
+                Utils.SilentDispose(m_publishTimer);
+                m_publishTimer = null;
+
+                if (m_messageWorkerTask == null)
+                {
+                    Utils.SilentDispose(m_messageWorkerCts);
+                    m_messageWorkerCts = null;
+                    return;
+                }
+
+                // Get references to stop the worker (will signal outside of lock)
+                workerTask = m_messageWorkerTask;
+                workerCts = m_messageWorkerCts;
+                m_messageWorkerTask = null;
+                m_messageWorkerCts = null;
+            }
+
+            // Signal the worker to stop (outside of lock to avoid deadlock)
+            m_messageWorkerEvent.Set();
+            workerCts?.Cancel();
+
+            // Await the worker task to complete
             try
             {
-                m_messageWorkerEvent.Set();
-                workerCts?.Cancel();
                 await workerTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when cancellation is requested
             }
             catch (Exception e)
             {
-                m_logger.LogError(e, "SubscriptionId {SubscriptionId} - Reset Publish Worker exception.", Id);
+                m_logger.LogError(e, "SubscriptionId {SubscriptionId} - Publish Worker exception.", Id);
             }
             finally
             {
